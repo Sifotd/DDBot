@@ -6,6 +6,7 @@ class DraftFlow(StatesGroup):
     button_text = State()
     button_url = State()
     target = State()
+    interval = State()
     preview = State()
     modify_content = State()
     modify_button_text = State()

@@ -112,3 +112,34 @@ async def test_relay_claim_is_idempotent(tmp_path: Path) -> None:
     duplicate = await db.claim_relay(-1001, 10, "eai", -1002, 28604)
     assert first is True
     assert duplicate is False
+
+
+@pytest.mark.asyncio
+async def test_new_schedule_replaces_old_schedule_for_same_topic(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.sqlite3")
+    await db.initialize()
+    first_id = await db.create_post(1, "旧", None, None, None, {"eai": "@old"})
+    second_id = await db.create_post(1, "新", None, None, None, {"eai": "@new"})
+
+    await db.replace_scheduled_pushes(first_id, ["eai"], 3600)
+    await db.replace_scheduled_pushes(second_id, ["eai"], 7200)
+
+    first = await db.get_scheduled_pushes(post_id=first_id)
+    second = await db.get_scheduled_pushes(post_id=second_id)
+    assert first[0].active is False
+    assert second[0].active is True
+    assert second[0].interval_seconds == 7200
+
+
+@pytest.mark.asyncio
+async def test_one_time_publish_stops_old_schedule(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.sqlite3")
+    await db.initialize()
+    old_id = await db.create_post(1, "旧", None, None, None, {"korean": "@old"})
+    new_id = await db.create_post(1, "新", None, None, None, {"korean": "@new"})
+    await db.replace_scheduled_pushes(old_id, ["korean"], 3600)
+
+    created = await db.replace_scheduled_pushes(new_id, ["korean"], None)
+
+    assert created == []
+    assert await db.get_scheduled_pushes(active_only=True) == []

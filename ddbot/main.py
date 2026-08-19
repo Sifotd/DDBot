@@ -10,6 +10,7 @@ from .config import get_settings
 from .db import Database
 from .handlers import router
 from .middleware import AdminMiddleware
+from .scheduler import PushScheduler
 from .service import PublishingService
 
 
@@ -20,18 +21,24 @@ async def run() -> None:
     # User-authored content is sent as plain text so angle brackets cannot break Telegram parsing.
     bot = Bot(settings.bot_token)
     service = PublishingService(bot, db, settings)
+    scheduler = PushScheduler(db, service)
     dispatcher = Dispatcher(storage=MemoryStorage())
     router.message.middleware(AdminMiddleware(settings.admin_user_ids))
     router.callback_query.middleware(AdminMiddleware(settings.admin_user_ids))
     dispatcher.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
-    await dispatcher.start_polling(
-        bot,
-        settings=settings,
-        db=db,
-        service=service,
-        allowed_updates=dispatcher.resolve_used_update_types(),
-    )
+    await scheduler.start()
+    try:
+        await dispatcher.start_polling(
+            bot,
+            settings=settings,
+            db=db,
+            service=service,
+            scheduler=scheduler,
+            allowed_updates=dispatcher.resolve_used_update_types(),
+        )
+    finally:
+        await scheduler.close()
 
 
 def main() -> None:

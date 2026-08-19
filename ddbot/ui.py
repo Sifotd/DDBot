@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .models import Delivery, Post
+from .models import Delivery, Post, ScheduledPush
 
 STATUS_LABELS = {
     "published": "已发布",
@@ -51,12 +51,44 @@ def button_choice() -> InlineKeyboardMarkup:
     )
 
 
-def channel_choice() -> InlineKeyboardMarkup:
+def channel_choice(channels: dict[str, str]) -> InlineKeyboardMarkup:
+    names = {
+        "eai": "Alice EAI（英文）",
+        "korean": "Alice Korean Bet（韩文）",
+        "traditional": "Alice（繁體中文）",
+    }
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=names.get(key, username), callback_data=f"draft:target:{key}"
+            )
+        ]
+        for key, username in channels.items()
+    ]
+    if len(channels) > 1:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"全部 {len(channels)} 个频道", callback_data="draft:target:all"
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="❌ 取消", callback_data="draft:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def schedule_choice() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Alice EAI", callback_data="draft:target:eai")],
-            [InlineKeyboardButton(text="Alice Korean Bet", callback_data="draft:target:korean")],
-            [InlineKeyboardButton(text="两个频道", callback_data="draft:target:both")],
+            [InlineKeyboardButton(text="仅发布一次", callback_data="draft:interval:once")],
+            [
+                InlineKeyboardButton(text="每 30 分钟", callback_data="draft:interval:30m"),
+                InlineKeyboardButton(text="每 1 小时", callback_data="draft:interval:1h"),
+            ],
+            [
+                InlineKeyboardButton(text="每 6 小时", callback_data="draft:interval:6h"),
+                InlineKeyboardButton(text="每 24 小时", callback_data="draft:interval:24h"),
+            ],
             [InlineKeyboardButton(text="❌ 取消", callback_data="draft:cancel")],
         ]
     )
@@ -122,7 +154,9 @@ def posts_keyboard(posts: list[Post], offset: int, page_size: int = 8) -> Inline
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def post_actions(post_id: int, deliveries: list[Delivery]) -> InlineKeyboardMarkup:
+def post_actions(
+    post_id: int, deliveries: list[Delivery], schedules: list[ScheduledPush] | None = None
+) -> InlineKeyboardMarkup:
     active = any(item.message_id and item.status != "deleted" for item in deliveries)
     rows: list[list[InlineKeyboardButton]] = []
     if active:
@@ -145,6 +179,14 @@ def post_actions(post_id: int, deliveries: list[Delivery]) -> InlineKeyboardMark
                         text="🗑 删除频道消息", callback_data=f"manage:{post_id}:delete"
                     )
                 ],
+            ]
+        )
+    if schedules and any(item.active for item in schedules):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⏹ 停止定时推送", callback_data=f"schedule:stop:{post_id}"
+                )
             ]
         )
     rows.append([InlineKeyboardButton(text="⬅️ 返回列表", callback_data="posts:0")])
@@ -188,7 +230,9 @@ def template_keyboard(buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     )
 
 
-def post_summary(post: Post, deliveries: list[Delivery]) -> str:
+def post_summary(
+    post: Post, deliveries: list[Delivery], schedules: list[ScheduledPush] | None = None
+) -> str:
     delivery_lines = []
     for item in deliveries:
         state = STATUS_LABELS.get(item.status, item.status)
@@ -198,11 +242,29 @@ def post_summary(post: Post, deliveries: list[Delivery]) -> str:
         button = "频道快捷模板"
     else:
         button = f"{post.button_text} → {post.button_url}" if post.button_text else "无"
+    schedule_text = "未启用"
+    active_schedules = [item for item in schedules or [] if item.active]
+    if active_schedules:
+        schedule_text = "；".join(
+            f"{item.channel_key}: 每 {format_interval(item.interval_seconds)}，"
+            f"下次 {item.next_run_at.astimezone().strftime('%Y-%m-%d %H:%M')}"
+            + (f"（上次失败：{item.last_error}）" if item.last_error else "")
+            for item in active_schedules
+        )
     return (
         f"发布记录 #{post.id}\n"
         f"状态：{STATUS_LABELS.get(post.status, post.status)}\n"
         f"创建时间：{post.created_at.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
         f"正文：{post.text or '（无正文）'}\n"
         f"图片：{'有' if post.photo_file_id else '无'}\n"
-        f"按钮：{button}\n\n" + "\n".join(delivery_lines)
+        f"按钮：{button}\n"
+        f"定时推送：{schedule_text}\n\n" + "\n".join(delivery_lines)
     )
+
+
+def format_interval(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400} 天"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds // 60} 分钟"

@@ -7,3 +7,5 @@ __pycache__/
 *.egg-info/
 data/*.sqlite3*
 DDBot-deploy.zip
+DDBot-google-cloud.zip
+DDBot-google-cloud-v*.zip

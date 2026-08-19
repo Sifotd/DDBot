@@ -12,16 +12,19 @@ from aiogram.types import CallbackQuery, Message
 from .config import Settings
 from .db import Database
 from .models import Delivery, Post
+from .scheduler import PushScheduler
 from .service import PublishingService, format_results
 from .states import DraftFlow, ManageFlow
 from .ui import (
     channel_choice,
     draft_modify_menu,
+    format_interval,
     main_menu,
     post_actions,
     post_summary,
     posts_keyboard,
     preview_keyboard,
+    schedule_choice,
     scope_keyboard,
     valid_button_url,
 )
@@ -164,7 +167,7 @@ async def callback_cancel(query: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(DraftFlow.content)
-async def receive_content(message: Message, state: FSMContext) -> None:
+async def receive_content(message: Message, state: FSMContext, settings: Settings) -> None:
     if not await ensure_active(message, state):
         return
     if not message.text and not message.photo:
@@ -178,7 +181,7 @@ async def receive_content(message: Message, state: FSMContext) -> None:
     await state.set_state(DraftFlow.target)
     await message.answer(
         "已自动套用对应语言的三行按钮模板。请选择目标频道：",
-        reply_markup=channel_choice(),
+        reply_markup=channel_choice(settings.channels),
     )
 
 
@@ -193,25 +196,31 @@ async def add_button(query: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data == "draft:button:skip")
-async def skip_button(query: CallbackQuery, state: FSMContext) -> None:
+async def skip_button(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     if not await ensure_active(query, state):
         return
     await query.answer()
     await state.update_data(button_text=None, button_url=None)
     await state.set_state(DraftFlow.target)
     if query.message:
-        await query.message.answer("请选择目标频道：", reply_markup=channel_choice())
+        await query.message.answer(
+            "请选择目标频道：", reply_markup=channel_choice(settings.channels)
+        )
 
 
 @router.callback_query(F.data == "draft:button:template")
-async def use_button_template(query: CallbackQuery, state: FSMContext) -> None:
+async def use_button_template(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
     if not await ensure_active(query, state):
         return
     await query.answer()
     await state.update_data(button_text="__template__", button_url=None)
     await state.set_state(DraftFlow.target)
     if query.message:
-        await query.message.answer("请选择目标频道：", reply_markup=channel_choice())
+        await query.message.answer(
+            "请选择目标频道：", reply_markup=channel_choice(settings.channels)
+        )
 
 
 @router.message(DraftFlow.button_text)
@@ -228,7 +237,9 @@ async def receive_button_text(message: Message, state: FSMContext) -> None:
 
 
 @router.message(DraftFlow.button_url)
-async def receive_button_url(message: Message, state: FSMContext) -> None:
+async def receive_button_url(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if not await ensure_active(message, state):
         return
     value = (message.text or "").strip()
@@ -237,7 +248,7 @@ async def receive_button_url(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(button_url=value)
     await state.set_state(DraftFlow.target)
-    await message.answer("请选择目标频道：", reply_markup=channel_choice())
+    await message.answer("请选择目标频道：", reply_markup=channel_choice(settings.channels))
 
 
 @router.callback_query(F.data.startswith("draft:target:"))
@@ -245,11 +256,32 @@ async def choose_target(query: CallbackQuery, state: FSMContext, settings: Setti
     if not await ensure_active(query, state):
         return
     selection = (query.data or "").rsplit(":", 1)[-1]
-    keys = list(settings.channels) if selection == "both" else [selection]
+    keys = list(settings.channels) if selection in {"all", "both"} else [selection]
     if any(key not in settings.channels for key in keys):
         await query.answer("无效频道", show_alert=True)
         return
     await state.update_data(target_keys=keys)
+    await state.set_state(DraftFlow.interval)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "请选择定时推送间隔。首次会立即发布；选择“仅发布一次”则不重复推送。",
+            reply_markup=schedule_choice(),
+        )
+
+
+@router.callback_query(F.data.startswith("draft:interval:"))
+async def choose_interval(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not await ensure_active(query, state):
+        return
+    choice = (query.data or "").rsplit(":", 1)[-1]
+    values = {"once": None, "30m": 1800, "1h": 3600, "6h": 21600, "24h": 86400}
+    if choice not in values:
+        await query.answer("无效间隔", show_alert=True)
+        return
+    await state.update_data(interval_seconds=values[choice])
     await state.set_state(DraftFlow.preview)
     await query.answer()
     if query.message:
@@ -260,9 +292,15 @@ async def show_preview(message: Message, state: FSMContext, settings: Settings) 
     data = await state.get_data()
     targets = "、".join(settings.channels[key] for key in data["target_keys"])
     label = f"发布预览\n目标频道：{targets}"
+    interval_seconds = data.get("interval_seconds")
+    label += (
+        f"\n定时推送：每 {format_interval(interval_seconds)}"
+        if interval_seconds
+        else "\n定时推送：仅发布一次"
+    )
     template = None
     if data.get("button_text") == "__template__":
-        # 双频道模板文案不同；预览展示第一个目标频道的版本。
+        # 各频道模板文案不同；预览展示第一个目标频道的版本。
         template = settings.template_buttons(data["target_keys"][0])
         label += f"\n按钮模板：{settings.channels[data['target_keys'][0]]} 版本"
     markup = preview_keyboard(data.get("button_text"), data.get("button_url"), template)
@@ -277,7 +315,11 @@ async def show_preview(message: Message, state: FSMContext, settings: Settings) 
 
 @router.callback_query(F.data == "draft:publish")
 async def publish_draft(
-    query: CallbackQuery, state: FSMContext, settings: Settings, service: PublishingService
+    query: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    service: PublishingService,
+    scheduler: PushScheduler,
 ) -> None:
     if not await ensure_active(query, state):
         return
@@ -295,6 +337,7 @@ async def publish_draft(
         data.get("button_url"),
         targets,
     )
+    await scheduler.schedule(post_id, data["target_keys"], data.get("interval_seconds"))
     await state.clear()
     if query.message:
         await query.message.answer(
@@ -335,7 +378,9 @@ async def modify_draft_item(query: CallbackQuery, state: FSMContext, settings: S
     elif action == "target":
         await state.set_state(DraftFlow.target)
         if query.message:
-            await query.message.answer("请选择目标频道：", reply_markup=channel_choice())
+            await query.message.answer(
+                "请选择目标频道：", reply_markup=channel_choice(settings.channels)
+            )
         return
     else:
         if query.message:
@@ -413,10 +458,24 @@ async def view_post(query: CallbackQuery, db: Database) -> None:
         await query.answer("记录不存在", show_alert=True)
         return
     deliveries = await db.get_deliveries(post_id)
+    schedules = await db.get_scheduled_pushes(post_id=post_id)
     await query.answer()
     if query.message:
         await query.message.answer(
-            post_summary(post, deliveries), reply_markup=post_actions(post_id, deliveries)
+            post_summary(post, deliveries, schedules),
+            reply_markup=post_actions(post_id, deliveries, schedules),
+        )
+
+
+@router.callback_query(F.data.startswith("schedule:stop:"))
+async def stop_schedule(query: CallbackQuery, scheduler: PushScheduler) -> None:
+    post_id = int((query.data or "").rsplit(":", 1)[-1])
+    stopped = await scheduler.stop(post_id)
+    await query.answer("定时推送已停止" if stopped else "该任务已经停止")
+    if query.message:
+        await query.message.answer(
+            "已停止后续定时推送；此前发布的消息不会被删除。",
+            reply_markup=main_menu(),
         )
 
 

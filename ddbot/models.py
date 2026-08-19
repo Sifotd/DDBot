@@ -47,3 +47,17 @@ class Delivery:
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(slots=True)
+class ScheduledPush:
+    id: int
+    post_id: int
+    channel_key: str
+    interval_seconds: int
+    next_run_at: datetime
+    active: bool
+    last_run_at: datetime | None
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime

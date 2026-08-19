@@ -201,6 +201,31 @@ class PublishingService:
                 results.append(OperationResult(delivery.channel_username, False, detail))
         return results
 
+    async def send_to_topic(self, delivery: Delivery) -> Message:
+        """Send a fresh copy directly to the language topic for a recurring push."""
+        topic_id = self.settings.topics[delivery.channel_key]
+        markup = self._markup(
+            delivery.button_text, delivery.button_url, delivery.channel_key
+        )
+        if delivery.photo_file_id:
+            return await telegram_call(
+                lambda: self.bot.send_photo(
+                    self.settings.target_group_id,
+                    delivery.photo_file_id,
+                    caption=delivery.text,
+                    reply_markup=markup,
+                    message_thread_id=topic_id,
+                )
+            )
+        return await telegram_call(
+            lambda: self.bot.send_message(
+                self.settings.target_group_id,
+                delivery.text or "",
+                reply_markup=markup,
+                message_thread_id=topic_id,
+            )
+        )
+
     async def _send(
         self,
         channel: str,

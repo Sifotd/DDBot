@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from .models import Delivery, DeliveryStatus, Post, PostStatus
+from .models import Delivery, DeliveryStatus, Post, PostStatus, ScheduledPush
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -53,6 +53,21 @@ CREATE TABLE IF NOT EXISTS relays (
     updated_at TEXT NOT NULL,
     PRIMARY KEY(source_chat_id, source_message_id)
 );
+CREATE TABLE IF NOT EXISTS scheduled_pushes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    channel_key TEXT NOT NULL,
+    interval_seconds INTEGER NOT NULL,
+    next_run_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    last_run_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(post_id, channel_key)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_pushes_due
+ON scheduled_pushes(active, next_run_at);
 """
 
 
@@ -226,6 +241,104 @@ class Database:
             )
         return [self._post(row) for row in rows]
 
+    async def replace_scheduled_pushes(
+        self, post_id: int, channel_keys: list[str], interval_seconds: int | None
+    ) -> list[ScheduledPush]:
+        """Activate this post and stop older schedules targeting the same topics."""
+        if not channel_keys:
+            return []
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        placeholders = ",".join("?" for _ in channel_keys)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                f"""UPDATE scheduled_pushes SET active=0, updated_at=?
+                WHERE active=1 AND channel_key IN ({placeholders})""",  # noqa: S608
+                (now_text, *channel_keys),
+            )
+            if interval_seconds is None:
+                await db.commit()
+                return []
+            next_run = (now + timedelta(seconds=interval_seconds)).isoformat()
+            await db.executemany(
+                """INSERT INTO scheduled_pushes
+                (post_id,channel_key,interval_seconds,next_run_at,active,created_at,updated_at)
+                VALUES (?,?,?,?,1,?,?)
+                ON CONFLICT(post_id,channel_key) DO UPDATE SET
+                interval_seconds=excluded.interval_seconds,
+                next_run_at=excluded.next_run_at,
+                active=1,
+                last_run_at=NULL,
+                last_error=NULL,
+                updated_at=excluded.updated_at""",
+                [
+                    (post_id, key, interval_seconds, next_run, now_text, now_text)
+                    for key in channel_keys
+                ],
+            )
+            await db.commit()
+        return await self.get_scheduled_pushes(post_id=post_id, active_only=True)
+
+    async def stop_scheduled_pushes(self, post_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """UPDATE scheduled_pushes SET active=0, updated_at=?
+                WHERE post_id=? AND active=1""",
+                (now_iso(), post_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def get_scheduled_pushes(
+        self, post_id: int | None = None, active_only: bool = False
+    ) -> list[ScheduledPush]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if post_id is not None:
+            clauses.append("post_id=?")
+            params.append(post_id)
+        if active_only:
+            clauses.append("active=1")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                f"SELECT * FROM scheduled_pushes{where} ORDER BY id",  # noqa: S608
+                params,
+            )
+        return [self._scheduled_push(row) for row in rows]
+
+    async def complete_scheduled_run(
+        self, schedule_id: int, expected_run_at: datetime, error: str | None = None
+    ) -> bool:
+        """Advance a still-current schedule; false means it was stopped or replaced."""
+        finished_at = datetime.now(UTC)
+        async with aiosqlite.connect(self.path) as db:
+            row = await db.execute_fetchall(
+                "SELECT interval_seconds, active FROM scheduled_pushes WHERE id=?",
+                (schedule_id,),
+            )
+            if not row or not row[0][1]:
+                return False
+            interval_seconds = row[0][0]
+            next_run_at = expected_run_at + timedelta(seconds=interval_seconds)
+            while next_run_at <= finished_at:
+                next_run_at += timedelta(seconds=interval_seconds)
+            cursor = await db.execute(
+                """UPDATE scheduled_pushes SET next_run_at=?, last_run_at=?,
+                last_error=?, updated_at=? WHERE id=? AND active=1 AND next_run_at=?""",
+                (
+                    next_run_at.isoformat(),
+                    finished_at.isoformat(),
+                    error,
+                    finished_at.isoformat(),
+                    schedule_id,
+                    expected_run_at.isoformat(),
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
     async def claim_relay(
         self,
         source_chat_id: int,
@@ -314,6 +427,23 @@ class Database:
             button_text=row["button_text"],
             button_url=row["button_url"],
             status=row["status"],
+            last_error=row["last_error"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _scheduled_push(row: aiosqlite.Row) -> ScheduledPush:
+        return ScheduledPush(
+            id=row["id"],
+            post_id=row["post_id"],
+            channel_key=row["channel_key"],
+            interval_seconds=row["interval_seconds"],
+            next_run_at=datetime.fromisoformat(row["next_run_at"]),
+            active=bool(row["active"]),
+            last_run_at=(
+                datetime.fromisoformat(row["last_run_at"]) if row["last_run_at"] else None
+            ),
             last_error=row["last_error"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
