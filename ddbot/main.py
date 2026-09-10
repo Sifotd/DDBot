@@ -10,7 +10,7 @@ from .config import get_settings
 from .db import Database
 from .handlers import router
 from .middleware import AdminMiddleware
-from .scheduler import PushScheduler
+from .scheduler import LatestTopicScheduler, PushScheduler
 from .service import PublishingService
 
 
@@ -22,12 +22,20 @@ async def run() -> None:
     bot = Bot(settings.bot_token)
     service = PublishingService(bot, db, settings)
     scheduler = PushScheduler(db, service)
+    latest_topic_scheduler = LatestTopicScheduler(db, service)
     dispatcher = Dispatcher(storage=MemoryStorage())
-    router.message.middleware(AdminMiddleware(settings.admin_user_ids))
+    router.message.middleware(
+        AdminMiddleware(
+            settings.admin_user_ids,
+            settings.target_group_id,
+            frozenset(settings.monitored_topics.values()),
+        )
+    )
     router.callback_query.middleware(AdminMiddleware(settings.admin_user_ids))
     dispatcher.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     await scheduler.start()
+    await latest_topic_scheduler.start()
     try:
         await dispatcher.start_polling(
             bot,
@@ -38,6 +46,7 @@ async def run() -> None:
             allowed_updates=dispatcher.resolve_used_update_types(),
         )
     finally:
+        await latest_topic_scheduler.close()
         await scheduler.close()
 
 

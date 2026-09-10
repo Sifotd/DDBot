@@ -44,14 +44,14 @@ def test_language_templates_have_three_buttons(tmp_path) -> None:
     assert "채팅방" in korean[0][0]
     expected_urls = [
         "https://t.me/thealiceai/28604",
-        "https://t.me/aliceeaichannel",
-        "https://thealiceai.com/saba",
+        "https://t.me/AliceSmartPicksEN",
+        "https://thealiceai.com/?code=N6WVL",
     ]
     assert [url for _, url in english] == expected_urls
     assert [url for _, url in korean] == [
         "https://t.me/thealiceai/28604",
-        "https://t.me/alicekoreanbet",
-        "https://thealiceai.com/saba",
+        "https://t.me/AliceSmartPicksKR",
+        "https://thealiceai.com/?code=N6WVL",
     ]
     assert len(template_keyboard(english).inline_keyboard) == 3
 
@@ -72,6 +72,7 @@ def test_traditional_chinese_channel_and_template(tmp_path) -> None:
         "🤑 開始使用 Alice 獲利",
     ]
     assert traditional[1][1] == "https://t.me/alicesmartpick"
+    assert traditional[2][1] == "https://thealiceai.com/?code=N6WVL"
 
     keyboard = channel_choice(settings.channels)
     labels = [button.text for row in keyboard.inline_keyboard for button in row]
@@ -90,3 +91,61 @@ def test_schedule_choice_contains_only_fixed_intervals() -> None:
     assert "每 6 小时" in labels
     assert "每 24 小时" in labels
     assert "自定义间隔" not in labels
+
+
+def test_latest_push_uses_hourly_interval_and_enabled_topic_mapping(tmp_path) -> None:
+    settings = Settings(
+        bot_token="token", admin_user_ids="12", database_path=tmp_path / "db.sqlite3",
+        topic_latest_push_enabled=True,
+    )
+
+    assert settings.topic_latest_push_interval_seconds == 3600
+    assert settings.enabled_topics == {
+        "eai": settings.topic_eai,
+        "korean": settings.topic_korean,
+        "russian": 348731,
+    }
+
+
+def test_russian_channel_topic_and_template():
+    settings = Settings(
+        bot_token="123:test", admin_user_ids="12",
+        channel_alice_russian="@test_russian", topic_russian=12345,
+        topic_latest_push_enabled=True,
+    )
+    assert settings.channels["russian"] == "@test_russian"
+    assert settings.enabled_topics["russian"] == 12345
+    buttons = settings.template_buttons("russian")
+    assert len(buttons) == 3
+    assert buttons[0][1] == "https://t.me/c/3869352469/12345"
+    assert buttons[1][1] == "https://t.me/test_russian"
+    callbacks = [
+        button.callback_data
+        for row in channel_choice(settings.channels).inline_keyboard for button in row
+    ]
+    assert "draft:target:russian" in callbacks
+
+
+def test_topic_monitoring_remains_enabled_without_latest_repush():
+    settings = Settings(
+        bot_token="123:test", admin_user_ids="12", topic_latest_push_enabled=False,
+        topic_russian=12345,
+    )
+    assert settings.enabled_topics == {}
+    assert settings.monitored_topics["russian"] == 12345
+    assert "eai" in settings.monitored_topics
+
+
+def test_latest_topic_repush_is_disabled_by_default():
+    settings = Settings(bot_token="123:test", admin_user_ids="12")
+    assert settings.topic_latest_push_enabled is False
+    assert settings.enabled_topics == {}
+
+
+def test_russian_channel_without_topic_only_publishes_to_channel():
+    settings = Settings(
+        bot_token="123:test", admin_user_ids="12", channel_alice_russian="@test_russian",
+        topic_russian=None,
+    )
+    assert "russian" in settings.channels
+    assert not settings.should_relay_to_topic("russian")

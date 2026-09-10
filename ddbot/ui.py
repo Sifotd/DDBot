@@ -56,6 +56,7 @@ def channel_choice(channels: dict[str, str]) -> InlineKeyboardMarkup:
         "eai": "Alice EAI（英文）",
         "korean": "Alice Korean Bet（韩文）",
         "traditional": "Alice（繁體中文）",
+        "russian": "Alice（俄语 / Русский）",
     }
     rows = [
         [
@@ -210,7 +211,8 @@ def scope_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="同步操作两个频道", callback_data=f"scope:{post_id}:{operation}:all"
+                    text=f"同步操作全部 {len(active)} 个频道",
+                    callback_data=f"scope:{post_id}:{operation}:all",
                 )
             ]
         )
@@ -256,7 +258,7 @@ def post_summary(
         f"状态：{STATUS_LABELS.get(post.status, post.status)}\n"
         f"创建时间：{post.created_at.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
         f"正文：{post.text or '（无正文）'}\n"
-        f"图片：{'有' if post.photo_file_id else '无'}\n"
+        f"图片：{len(post.photo_file_ids)} 张\n"
         f"按钮：{button}\n"
         f"定时推送：{schedule_text}\n\n" + "\n".join(delivery_lines)
     )

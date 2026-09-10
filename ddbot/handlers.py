@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
@@ -13,7 +13,7 @@ from .config import Settings
 from .db import Database
 from .models import Delivery, Post
 from .scheduler import PushScheduler
-from .service import PublishingService, format_results
+from .service import PublishingService, format_results, is_bot_command_text
 from .states import DraftFlow, ManageFlow
 from .ui import (
     channel_choice,
@@ -31,19 +31,191 @@ from .ui import (
 
 router = Router(name=__name__)
 logger = logging.getLogger(__name__)
+ALBUM_SETTLE_SECONDS = 0.8
+_album_batches: dict[tuple[int, int, str], list[Message]] = {}
+_channel_album_batches: dict[tuple[int, str, str], list[Message]] = {}
+_publish_locks: dict[int, asyncio.Lock] = {}
+
+
+def telegram_text_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def content_length_error(text: str | None, has_photo: bool) -> str | None:
+    if text is None:
+        return None
+    limit = 1024 if has_photo else 4096
+    length = telegram_text_units(text)
+    if length <= limit:
+        return None
+    kind = "图片说明" if has_photo else "正文"
+    return f"{kind}长度为 {length}，超过 Telegram 上限 {limit}，请缩短后重试。"
+
+
+class EnabledTopicMessageFilter(BaseFilter):
+    async def __call__(self, message: Message, settings: Settings) -> bool:
+        return (
+            message.chat.id == settings.target_group_id
+            and message.message_thread_id in settings.monitored_topics.values()
+        )
+
+
+@router.message(EnabledTopicMessageFilter())
+async def observe_latest_topic_message(
+    message: Message,
+    settings: Settings,
+    db: Database,
+    service: PublishingService,
+) -> None:
+    topic_id = message.message_thread_id
+    if topic_id is None:
+        return
+    if message.media_group_id:
+        # Albums arrive as separate updates; re-sending only the final item would be
+        # misleading, so keep the album as the latest but mark it unsupported.
+        content_type = "media_group"
+        text = message.caption
+        photo_file_id = None
+    elif message.photo:
+        content_type = "photo"
+        text = message.caption
+        photo_file_id = message.photo[-1].file_id
+    elif message.text is not None:
+        content_type = "bot_command" if is_bot_command_text(message.text) else "text"
+        text = message.text
+        photo_file_id = None
+    else:
+        content_type = message.content_type
+        text = None
+        photo_file_id = None
+    sender_id = message.from_user.id if message.from_user else None
+    sent_by_bot = sender_id == service.bot.id
+    stored = await db.observe_topic_message(
+        settings.target_group_id,
+        topic_id,
+        message.message_id,
+        sender_id,
+        sent_by_bot,
+        content_type,
+        text,
+        photo_file_id,
+    )
+    if stored:
+        log = logger.warning if content_type not in {"text", "photo"} else logger.info
+        log(
+            "Observed latest topic message: topic=%s message=%s type=%s sent_by_bot=%s",
+            topic_id,
+            message.message_id,
+            content_type,
+            sent_by_bot,
+        )
+
+
+async def collect_photos(message: Message) -> tuple[list[str], str | None] | None:
+    """Collect all updates belonging to one Telegram media group."""
+    if not message.photo:
+        return [], None
+    if not message.media_group_id:
+        return [message.photo[-1].file_id], message.caption
+    key = (
+        message.chat.id,
+        message.from_user.id if message.from_user else 0,
+        message.media_group_id,
+    )
+    batch = _album_batches.get(key)
+    if batch is not None:
+        batch.append(message)
+        return None
+    batch = [message]
+    _album_batches[key] = batch
+    while len(batch) < 10:
+        observed_count = len(batch)
+        await asyncio.sleep(ALBUM_SETTLE_SECONDS)
+        if len(batch) == observed_count:
+            break
+    messages = sorted(_album_batches.pop(key, batch), key=lambda item: item.message_id)
+    return [item.photo[-1].file_id for item in messages if item.photo], next(
+        (item.caption for item in messages if item.caption is not None), None
+    )
+
+
+async def collect_channel_album(
+    message: Message, batch_kind: str = "new"
+) -> list[Message] | None:
+    if not message.media_group_id:
+        return [message]
+    key = (message.chat.id, message.media_group_id, batch_kind)
+    batch = _channel_album_batches.get(key)
+    if batch is not None:
+        batch.append(message)
+        return None
+    batch = [message]
+    _channel_album_batches[key] = batch
+    while len(batch) < 10:
+        observed_count = len(batch)
+        await asyncio.sleep(ALBUM_SETTLE_SECONDS)
+        if len(batch) == observed_count:
+            break
+    return sorted(
+        _channel_album_batches.pop(key, batch), key=lambda item: item.message_id
+    )
 
 
 @router.channel_post()
-async def relay_channel_post(message: Message, settings: Settings, db: Database) -> None:
-    await relay_to_topic(message, settings, db, replace=False)
+async def relay_channel_post(
+    message: Message,
+    settings: Settings,
+    db: Database,
+    service: PublishingService,
+) -> None:
+    messages = await collect_channel_album(message)
+    if messages is None:
+        return
+    if len(messages) == 1:
+        await relay_to_topic(message, settings, db, service, replace=False)
+        return
+    username = (message.chat.username or "").lower()
+    channel_key = next(
+        (
+            key
+            for key, channel in settings.channels.items()
+            if username == channel.removeprefix("@").lower()
+        ),
+        None,
+    )
+    if channel_key and settings.should_relay_to_topic(channel_key):
+        await service.relay_published_messages(messages, channel_key)
 
 
 @router.edited_channel_post()
-async def relay_edited_channel_post(message: Message, settings: Settings, db: Database) -> None:
-    await relay_to_topic(message, settings, db, replace=True)
+async def relay_edited_channel_post(
+    message: Message,
+    settings: Settings,
+    db: Database,
+    service: PublishingService,
+) -> None:
+    username = (message.chat.username or "").lower()
+    channel_key = next(
+        (
+            key
+            for key, channel in settings.channels.items()
+            if username == channel.removeprefix("@").lower()
+        ),
+        None,
+    )
+    if channel_key and settings.should_relay_to_topic(channel_key):
+        result = await service.edit_relayed_message(message, channel_key)
+        if not result.ok:
+            logger.warning("Edited channel relay incomplete: %s", result.detail)
 
 
-async def relay_to_topic(message: Message, settings: Settings, db: Database, replace: bool) -> None:
+async def relay_to_topic(
+    message: Message,
+    settings: Settings,
+    db: Database,
+    service: PublishingService,
+    replace: bool,
+) -> None:
     username = (message.chat.username or "").lower()
     channel_key = next(
         (
@@ -55,55 +227,14 @@ async def relay_to_topic(message: Message, settings: Settings, db: Database, rep
     )
     if not channel_key:
         return
-    topic_id = settings.topics[channel_key]
-    previous = await db.get_relay(message.chat.id, message.message_id)
-    if not replace:
-        claimed = await db.claim_relay(
-            message.chat.id,
-            message.message_id,
-            channel_key,
-            settings.target_group_id,
-            topic_id,
-        )
-        if not claimed:
-            return
-    elif not previous:
-        await db.claim_relay(
-            message.chat.id,
-            message.message_id,
-            channel_key,
-            settings.target_group_id,
-            topic_id,
-        )
-    try:
-        forwarded = await message.bot.forward_message(
-            chat_id=settings.target_group_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            message_thread_id=topic_id,
-        )
-        await db.finish_relay(
-            message.chat.id, message.message_id, "forwarded", forwarded.message_id
-        )
-        if replace and previous and previous.get("forwarded_message_id"):
-            try:
-                await message.bot.delete_message(
-                    settings.target_group_id, previous["forwarded_message_id"]
-                )
-            except TelegramAPIError:
-                logger.exception(
-                    "Edited post re-forwarded, but old topic copy could not be deleted: %s",
-                    previous["forwarded_message_id"],
-                )
-    except TelegramAPIError as exc:
-        error = str(exc)[:300]
-        await db.finish_relay(message.chat.id, message.message_id, "failed", error=error)
-        logger.exception(
-            "Failed to relay channel post %s/%s to topic %s",
-            message.chat.id,
-            message.message_id,
-            topic_id,
-        )
+    if not settings.should_relay_to_topic(channel_key):
+        return
+    if replace:
+        result = await service.replace_relayed_messages([message], channel_key)
+    else:
+        result = await service.relay_published_message(message, channel_key)
+    if not result.ok:
+        logger.warning("Channel relay incomplete: %s", result.detail)
 
 
 def deadline(settings: Settings) -> str:
@@ -129,7 +260,7 @@ async def start_draft(message: Message, state: FSMContext, settings: Settings) -
     await state.set_state(DraftFlow.content)
     await state.update_data(expires_at=deadline(settings))
     await message.answer(
-        "请发送正文，或上传一张图片并在图片说明中填写正文。\n"
+        "请发送正文，或一次上传 1–10 张图片并在图片说明中填写正文。\n"
         "纯图片也可以发布；发送 /cancel 可随时取消。"
     )
 
@@ -171,12 +302,22 @@ async def receive_content(message: Message, state: FSMContext, settings: Setting
     if not await ensure_active(message, state):
         return
     if not message.text and not message.photo:
-        await message.answer("请发送文字或一张图片。")
+        await message.answer("请发送文字或 1–10 张图片。")
         return
-    text = message.caption if message.photo else message.text
-    photo = message.photo[-1].file_id if message.photo else None
+    collected = await collect_photos(message)
+    if collected is None:
+        return
+    photos, caption = collected
+    text = caption if photos else message.text
+    if error := content_length_error(text, bool(photos)):
+        await message.answer(error)
+        return
     await state.update_data(
-        text=text, photo_file_id=photo, button_text="__template__", button_url=None
+        text=text,
+        photo_file_id=photos[0] if photos else None,
+        photo_file_ids=photos,
+        button_text="__template__",
+        button_url=None,
     )
     await state.set_state(DraftFlow.target)
     await message.answer(
@@ -304,13 +445,34 @@ async def show_preview(message: Message, state: FSMContext, settings: Settings) 
         template = settings.template_buttons(data["target_keys"][0])
         label += f"\n按钮模板：{settings.channels[data['target_keys'][0]]} 版本"
     markup = preview_keyboard(data.get("button_text"), data.get("button_url"), template)
-    if data.get("photo_file_id"):
-        await message.answer_photo(
-            data["photo_file_id"], caption=data.get("text"), reply_markup=markup
-        )
-        await message.answer(label)
+    photo_ids = data.get("photo_file_ids") or (
+        [data["photo_file_id"]] if data.get("photo_file_id") else []
+    )
+    if photo_ids:
+        if len(photo_ids) > 1:
+            from aiogram.types import InputMediaPhoto
+
+            await message.answer_media_group(
+                [
+                    InputMediaPhoto(
+                        media=photo_id, caption=data.get("text") if index == 0 else None
+                    )
+                    for index, photo_id in enumerate(photo_ids)
+                ]
+            )
+            await message.answer(
+                f"{label}\n提示：Telegram 相册不支持内联按钮，发布时不会附带按钮。",
+                reply_markup=markup,
+            )
+        else:
+            await message.answer_photo(
+                photo_ids[0], caption=data.get("text"), reply_markup=markup
+            )
+            await message.answer(label)
     else:
-        await message.answer(f"{data.get('text') or ''}\n\n—\n{label}", reply_markup=markup)
+        if data.get("text"):
+            await message.answer(data["text"])
+        await message.answer(label, reply_markup=markup)
 
 
 @router.callback_query(F.data == "draft:publish")
@@ -321,28 +483,37 @@ async def publish_draft(
     service: PublishingService,
     scheduler: PushScheduler,
 ) -> None:
-    if not await ensure_active(query, state):
-        return
-    data = await state.get_data()
-    if not data.get("target_keys"):
-        await query.answer("发布数据不完整，请重新创建", show_alert=True)
-        return
-    await query.answer("正在发布…")
-    targets = {key: settings.channels[key] for key in data["target_keys"]}
-    post_id, results = await service.publish(
-        query.from_user.id,
-        data.get("text"),
-        data.get("photo_file_id"),
-        data.get("button_text"),
-        data.get("button_url"),
-        targets,
-    )
-    await scheduler.schedule(post_id, data["target_keys"], data.get("interval_seconds"))
-    await state.clear()
-    if query.message:
-        await query.message.answer(
-            f"发布记录 #{post_id}\n{format_results(results)}", reply_markup=main_menu()
-        )
+    lock = _publish_locks.setdefault(query.from_user.id, asyncio.Lock())
+    async with lock:
+        if not await ensure_active(query, state):
+            return
+        data = await state.get_data()
+        if not data.get("target_keys") or data.get("publishing"):
+            await query.answer("该草稿已经发布或正在发布", show_alert=True)
+            return
+        await state.update_data(publishing=True)
+        await query.answer("正在发布…")
+        targets = {key: settings.channels[key] for key in data["target_keys"]}
+        try:
+            post_id, results = await service.publish(
+                query.from_user.id,
+                data.get("text"),
+                data.get("photo_file_ids") or data.get("photo_file_id"),
+                data.get("button_text"),
+                data.get("button_url"),
+                targets,
+            )
+            await scheduler.schedule(
+                post_id, data["target_keys"], data.get("interval_seconds")
+            )
+        except Exception:
+            await state.update_data(publishing=False)
+            raise
+        await state.clear()
+        if query.message:
+            await query.message.answer(
+                f"发布记录 #{post_id}\n{format_results(results)}", reply_markup=main_menu()
+            )
 
 
 @router.callback_query(F.data == "draft:modify")
@@ -365,7 +536,7 @@ async def modify_draft_item(query: CallbackQuery, state: FSMContext, settings: S
     await query.answer()
     if action == "content":
         await state.set_state(DraftFlow.modify_content)
-        text = "请重新发送正文或图片（新内容将完整替换当前正文/图片）。"
+        text = "请重新发送正文或 1–10 张图片（新内容将完整替换当前内容）。"
     elif action == "button":
         await state.set_state(DraftFlow.modify_button_text)
         text = "请输入新的按钮显示文字。"
@@ -397,9 +568,18 @@ async def receive_modified_content(message: Message, state: FSMContext, settings
     if not message.text and not message.photo:
         await message.answer("请发送文字或图片。")
         return
+    collected = await collect_photos(message)
+    if collected is None:
+        return
+    photos, caption = collected
+    text = caption if photos else message.text
+    if error := content_length_error(text, bool(photos)):
+        await message.answer(error)
+        return
     await state.update_data(
-        text=message.caption if message.photo else message.text,
-        photo_file_id=message.photo[-1].file_id if message.photo else None,
+        text=text,
+        photo_file_id=photos[0] if photos else None,
+        photo_file_ids=photos,
     )
     await state.set_state(DraftFlow.preview)
     await show_preview(message, state, settings)
@@ -584,6 +764,11 @@ async def manage_text(
         await state.clear()
         return
     _, post, deliveries = loaded
+    if error := content_length_error(
+        text, any(delivery.photo_file_ids for delivery in deliveries)
+    ):
+        await message.answer(error)
+        return
     await db.update_post_content(post.id, text=text)
     deliveries = await update_selected_content(db, deliveries, text=text)
     updated = await db.get_post(post.id)
@@ -600,24 +785,36 @@ async def manage_photo(
     if not await ensure_active(message, state):
         return
     if not message.photo:
-        await message.answer("请上传一张图片。")
+        await message.answer("请一次上传 1–10 张图片。")
         return
+    collected = await collect_photos(message)
+    if collected is None:
+        return
+    photos, _ = collected
     loaded = await load_management(state, db)
     if not loaded:
         await state.clear()
         return
     _, post, deliveries = loaded
-    old_media_ids = {delivery.id for delivery in deliveries if delivery.photo_file_id}
-    await db.update_post_content(post.id, photo_file_id=message.photo[-1].file_id)
+    if error := next(
+        (
+            length_error
+            for delivery in deliveries
+            if (length_error := content_length_error(delivery.text, has_photo=True))
+        ),
+        None,
+    ):
+        await message.answer(error)
+        return
+    await db.update_post_content(
+        post.id, photo_file_id=photos[0], photo_file_ids=photos
+    )
     deliveries = await update_selected_content(
-        db, deliveries, photo_file_id=message.photo[-1].file_id
+        db, deliveries, photo_file_id=photos[0], photo_file_ids=photos
     )
     updated = await db.get_post(post.id)
     assert updated
-    media_deliveries = [item for item in deliveries if item.id in old_media_ids]
-    text_deliveries = [item for item in deliveries if item.id not in old_media_ids]
-    results = await service.edit(updated, media_deliveries)
-    results.extend(await service.replace_text_with_photo(updated, text_deliveries))
+    results = await service.replace_text_with_photo(updated, deliveries)
     await state.clear()
     await message.answer(format_results(results), reply_markup=main_menu())
 

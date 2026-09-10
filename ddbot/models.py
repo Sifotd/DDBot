@@ -30,6 +30,7 @@ class Post:
     status: str
     created_at: datetime
     updated_at: datetime
+    photo_file_ids: list[str]
 
 
 @dataclass(slots=True)
@@ -47,6 +48,9 @@ class Delivery:
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+    photo_file_ids: list[str]
+    message_ids: list[int]
+    orphaned_message_ids: list[int]
 
 
 @dataclass(slots=True)
@@ -60,4 +64,21 @@ class ScheduledPush:
     last_run_at: datetime | None
     last_error: str | None
     created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class TopicLatestMessage:
+    target_chat_id: int
+    topic_id: int
+    message_id: int
+    sender_id: int | None
+    sent_by_bot: bool
+    content_type: str
+    text: str | None
+    photo_file_id: str | None
+    last_pushed_message_id: int | None
+    pushed_message_id: int | None
+    last_error: str | None
+    observed_at: datetime
     updated_at: datetime

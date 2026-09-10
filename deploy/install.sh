@@ -31,8 +31,14 @@ else
 fi
 
 echo "[1/6] 安装 Python 运行环境..."
-sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv
+if [[ ${EXISTING_CONFIG} == true ]] && \
+  sudo -u "${APP_USER}" "${APP_DIR}/.venv/bin/python" -c \
+    'import sys, venv; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+  echo "现有 Python 环境可用，跳过 apt 系统安装。"
+else
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv
+fi
 if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; then
   echo "需要 Python 3.11 或更高版本。请使用 Debian 12 或 Ubuntu 24.04。" >&2
   exit 1
@@ -60,19 +66,35 @@ else
     "BOT_TOKEN=${BOT_TOKEN}" \
     "ADMIN_USER_IDS=7164480509,6404111657,8156318561" \
     "DATABASE_PATH=${DATA_DIR}/ddbot.sqlite3" \
-    "CHANNEL_ALICE_EAI=@aliceeaichannel" \
-    "CHANNEL_ALICE_KOREAN=@alicekoreanbet" \
+    "CHANNEL_ALICE_EAI=@AliceSmartPicksEN" \
+    "CHANNEL_ALICE_KOREAN=@AliceSmartPicksKR" \
     "CHANNEL_ALICE_TRADITIONAL=@alicesmartpick" \
+    "ALICE_START_URL=https://thealiceai.com/?code=N6WVL" \
     "FLOW_TIMEOUT_MINUTES=30" \
     "TARGET_GROUP_ID=-1003869352469" \
     "TOPIC_EAI=28604" \
     "TOPIC_KOREAN=23669" \
-    "TOPIC_TRADITIONAL=28601" | sudo tee "${ENV_FILE}" >/dev/null
+    "TOPIC_RUSSIAN=348731" \
+    "TOPIC_TRADITIONAL=28601" \
+    "RELAY_TRADITIONAL_TO_TOPIC=false" \
+    "TOPIC_LATEST_PUSH_ENABLED=false" \
+    "TOPIC_LATEST_PUSH_INTERVAL_SECONDS=3600" | sudo tee "${ENV_FILE}" >/dev/null
   unset BOT_TOKEN
 fi
 
 echo "[5/6] 配置 systemd 常驻服务..."
-sudo tee "${SERVICE_FILE}" >/dev/null <<'EOF'
+DATABASE_PATH_VALUE=$(sudo awk -F= '$1 == "DATABASE_PATH" {sub(/^[^=]*=/, ""); print}' "${ENV_FILE}" | tail -n 1)
+if [[ -z ${DATABASE_PATH_VALUE} ]]; then
+  DATABASE_PATH_VALUE=${DATA_DIR}/ddbot.sqlite3
+fi
+if [[ ${DATABASE_PATH_VALUE} = /* ]]; then
+  DATABASE_DIR=$(dirname -- "${DATABASE_PATH_VALUE}")
+else
+  DATABASE_DIR=${APP_DIR}/$(dirname -- "${DATABASE_PATH_VALUE}")
+fi
+sudo install -d -o "${APP_USER}" -g "${APP_USER}" -m 0750 "${DATABASE_DIR}"
+
+sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=Telegram Channel Publishing Bot
 Wants=network-online.target
@@ -92,7 +114,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ddbot
+ReadWritePaths=/var/lib/ddbot "${DATABASE_DIR}"
 
 [Install]
 WantedBy=multi-user.target
@@ -113,6 +135,6 @@ else
 fi
 
 echo
-echo "下一步：将 Bot 加入两个频道并授予发布、编辑、删除消息权限。"
+echo "下一步：将 Bot 加入三个频道并授予发布、编辑、删除消息权限。"
 echo "查看日志：sudo journalctl -u ddbot -f"
 echo "重启服务：sudo systemctl restart ddbot"
